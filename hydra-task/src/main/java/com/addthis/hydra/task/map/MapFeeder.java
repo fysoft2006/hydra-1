@@ -13,31 +13,18 @@
  */
 package com.addthis.hydra.task.map;
 
-import javax.annotation.Nullable;
 
 import java.util.NoSuchElementException;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveAction;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import java.text.DecimalFormat;
-
 import com.addthis.basis.util.Parameter;
-import com.addthis.basis.util.LessStrings;
 
 import com.addthis.bundle.core.Bundle;
-import com.addthis.bundle.core.BundleField;
-import com.addthis.bundle.core.kvp.KVBundle;
-import com.addthis.bundle.util.ValueUtil;
-import com.addthis.hydra.common.hash.PluggableHashFunction;
 import com.addthis.hydra.task.source.TaskDataSource;
-
-import com.google.common.util.concurrent.Uninterruptibles;
-
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Meter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,12 +32,7 @@ import org.slf4j.LoggerFactory;
 public final class MapFeeder implements Runnable {
     private static final Logger log = LoggerFactory.getLogger(MapFeeder.class);
 
-    private static final Bundle TERM_BUNDLE = new KVBundle();
-    private static final DecimalFormat timeFormat = new DecimalFormat("#,###.00");
-    private static final DecimalFormat countFormat = new DecimalFormat("#,###");
     private static final int QUEUE_DEPTH = Parameter.intValue("task.queue.depth", 100);
-    private static final int stealThreshold = Parameter.intValue("task.queue.worksteal.threshold", 50);
-    private static final boolean shouldSteal = Parameter.boolValue("task.worksteal", false);
 
     // state control
     private final AtomicBoolean errored = new AtomicBoolean(false);
@@ -61,46 +43,20 @@ public final class MapFeeder implements Runnable {
     private final TaskDataSource source;
 
     // mapper task controls
-    private final int feeders;
-    private final BundleField shardField;
-    private final Thread[] threads;
-    private final BlockingQueue<Bundle>[] queues;
+    private final ForkJoinPool mapperPool;
+    private final int parallelism;
+    private final Semaphore enqueuePermits;
 
-    // metrics
-    private final long start = System.currentTimeMillis();
-
-    @Nullable private final Meter stealAttemptMeter;
-    @Nullable private final Meter stealSuccessMeter;
-
-    public MapFeeder(StreamMapper task, TaskDataSource source, int feeders) {
-        if (shouldSteal) {
-            stealAttemptMeter = Metrics.newMeter(getClass(), "stealAttemptRate", "steals", TimeUnit.SECONDS);
-            stealSuccessMeter = Metrics.newMeter(getClass(), "stealSuccessRate", "steals", TimeUnit.SECONDS);
-        } else {
-            stealAttemptMeter = null;
-            stealSuccessMeter = null;
-        }
-
+    public MapFeeder(StreamMapper task, TaskDataSource source, int parallelism) {
         this.source = source;
         this.task = task;
-        this.feeders = feeders;
-
-        shardField = source.getShardField();
-        threads = new Thread[feeders];
-        queues = new LinkedBlockingQueue[feeders];
-
-        for (int i = 0; i < threads.length; i++) {
-            queues[i] = new LinkedBlockingQueue<>(QUEUE_DEPTH);
-            threads[i] = new Thread(new MapperTask(this, i), "MapProcessor #" + i);
-        }
+        this.parallelism = parallelism;
+        this.mapperPool = new ForkJoinPool(parallelism);
+        this.enqueuePermits = new Semaphore(QUEUE_DEPTH);
     }
 
     @Override public void run() {
-        log.info("starting {} thread(s) for src={}", feeders, source);
-        for (Thread thread : threads) {
-            thread.start();
-        }
-
+        log.info("starting {} thread(s) for src={}", parallelism, source);
         try {
             if (source.isEnabled()) {
                 while (fillBuffer()) {
@@ -111,10 +67,10 @@ public final class MapFeeder implements Runnable {
             }
             closeSourceIfNeeded();
             joinProcessors();
-            log.info("all ({}) task threads exited; sending taskComplete", feeders);
+            log.info("all ({}) task threads exited; sending taskComplete", parallelism);
 
             // run in different threads to isolate them from interrupts. ie. "taskCompleteUninterruptibly"
-            // join awaits completion, is uninterruptible, and will propogate any exception
+            // join awaits completion, is uninterruptible, and will propagate any exception
             CompletableFuture.runAsync(task::taskComplete).join();
         } catch (Throwable t) {
             handleUncaughtThrowable(t);
@@ -133,43 +89,35 @@ public final class MapFeeder implements Runnable {
         }
     }
 
+    /**
+     * Push the next bundle onto the work queue. Returns true
+     * to continue processing. If another thread has interrupted
+     * ourselves then set our interrupt status. This will close
+     * the current source and continue to consume any remaining elements
+     * from the queue.
+     */
     private boolean fillBuffer() {
-        // iterate over inputs and execute default target
+        boolean status = false;
         try {
+            enqueuePermits.acquire();
             Bundle p = source.next();
             if (p == null) {
                 log.info("exiting on null bundle from {}", source);
-                return false;
+            } else {
+                mapperPool.submit(new MapperTask(p));
+                status = true;
             }
-            int hash = p.hashCode();
-            if (shardField != null) {
-                String val = ValueUtil.asNativeString(p.getValue(shardField));
-                if (!LessStrings.isEmpty(val)) {
-                    hash = PluggableHashFunction.hash(val);
-                }
-            }
-            int mod = Math.abs(hash % queues.length);
-            pushQueue(mod, p);
-            return true;
         } catch (NoSuchElementException ignored) {
             log.info("exiting on premature stream termination");
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+            status = true;
         }
-        return false;
-    }
-
-    private void pushQueue(int queueNum, Bundle item) {
-        BlockingQueue<Bundle> queue = queues[queueNum];
-        Uninterruptibles.putUninterruptibly(queue, item);
+        return status;
     }
 
     private void joinProcessors() {
-        log.debug("pushing terminating bundles to {} processors", queues.length);
-        for (int i = 0; i < queues.length; i++) {
-            pushQueue(i, TERM_BUNDLE);
-        }
-        for (Thread thread : threads) {
-            Uninterruptibles.joinUninterruptibly(thread);
-        }
+        mapperPool.shutdown();
     }
 
     private void closeSourceIfNeeded() {
@@ -181,65 +129,22 @@ public final class MapFeeder implements Runnable {
         }
     }
 
-    private static class MapperTask implements Runnable {
-        private final int processorID;
-        private final MapFeeder mapFeeder;
+    private class MapperTask extends RecursiveAction {
 
-        public MapperTask(MapFeeder mapFeeder, int processorID) {
-            this.processorID = processorID;
-            this.mapFeeder = mapFeeder;
+        private final Bundle input;
+
+        public MapperTask(Bundle input) {
+            this.input = input;
         }
 
-        @Override
-        public void run() {
-            while (true) {
-                try {
-                    Bundle next = popQueue();
-                    if (next == null) {
-                        return;
-                    }
-                    mapFeeder.task.process(next);
-                } catch (Throwable t) {
-                    mapFeeder.handleUncaughtThrowable(t);
-                }
+        @Override protected void compute() {
+            try {
+                task.process(input);
+            } catch (Throwable t) {
+                handleUncaughtThrowable(t);
+            } finally {
+                enqueuePermits.release();
             }
-        }
-
-        @Nullable private Bundle popQueue() throws InterruptedException {
-            BlockingQueue<Bundle> queue = mapFeeder.queues[processorID];
-            Bundle item = null;
-            if (shouldSteal) {
-                // first check our own queue
-                item = queue.poll();
-                if (item == null) {
-                    // then check every other queue
-                    item = steal(queue);
-                }
-            }
-            if (item == null) {
-                item = queue.take();
-            }
-            if (item == TERM_BUNDLE) {
-                return null;
-            } else {
-                return item;
-            }
-        }
-
-        @Nullable private Bundle steal(BlockingQueue<Bundle> primaryQueue) throws InterruptedException {
-            mapFeeder.stealAttemptMeter.mark();
-            for (BlockingQueue<Bundle> queue : mapFeeder.queues) {
-                if ((queue != primaryQueue) && (queue.size() >= stealThreshold)) {
-                    Bundle item = queue.poll();
-                    if (item == TERM_BUNDLE) {
-                        queue.put(item);
-                    } else if (item != null) {
-                        mapFeeder.stealSuccessMeter.mark();
-                        return item;
-                    }
-                }
-            }
-            return null;
         }
     }
 }
